@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.15)
+project(dongzhenmao CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# 指定 x64-windows 架构路径（配合你之前的安装路径）
+set(TRIPLET "x64-windows")
+set(INTERCEPTION_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${TRIPLET}")
+
+# 查找头文件和库文件
+find_path(INTERCEPTION_INCLUDE_DIR interception.h
+    PATHS "${INTERCEPTION_DIR}/include"
+    NO_DEFAULT_PATH)
+
+find_library(INTERCEPTION_LIB interception
+    PATHS "${INTERCEPTION_DIR}/lib"
+    NO_DEFAULT_PATH)
+
+# 添加可执行文件
+add_executable(dongzhenmao dongzhenmao.cpp)
+
+# 关联头文件与库
+target_include_directories(dongzhenmao PRIVATE ${INTERCEPTION_INCLUDE_DIR})
+target_link_libraries(dongzhenmao PRIVATE ${INTERCEPTION_LIB})
+
+# 提示：运行生成的程序时，确保项目输出目录下有 interception.dll
+# 如果配置了 vcpkg 集成，vcpkg 会自动将 vcpkg_installed/x64-windows/bin 中的 dll 拷贝到可执行文件同级目录。
