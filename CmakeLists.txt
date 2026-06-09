@@ -1,27 +1,126 @@
 cmake_minimum_required(VERSION 3.15)
-project(dongzhenmao CXX)
+project(RecoilController LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+# ==============================================================================
+#  1. 基础编译环境配置
+# ==============================================================================
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 指定 x64-windows 架构路径（配合你之前的安装路径）
-set(TRIPLET "x64-windows")
-set(INTERCEPTION_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${TRIPLET}")
+# 设置为 Release 编译模式
+set(CMAKE_BUILD_TYPE Release)
 
-# 查找头文件和库文件
-find_path(INTERCEPTION_INCLUDE_DIR interception.h
-    PATHS "${INTERCEPTION_DIR}/include"
-    NO_DEFAULT_PATH)
+# 统一输出路径：基础输出路径设置为 build/bin
+set(BASE_OUT_DIR "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${BASE_OUT_DIR}")
 
-find_library(INTERCEPTION_LIB interception
-    PATHS "${INTERCEPTION_DIR}/lib"
-    NO_DEFAULT_PATH)
+# 遍历所有编译配置，强行重写它们的输出路径
+# 从而阻止 Visual Studio 在 bin 后面自动追加 /Debug 或 /Release 子目录
+foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES})
+    string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG_UPPER)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG_UPPER} "${BASE_OUT_DIR}")
+endforeach()
 
-# 添加可执行文件
-add_executable(dongzhenmao dongzhenmao.cpp)
+# ==============================================================================
+#  2. 定位所有本地依赖库的根目录 (vcpkg_installed 布局)
+# ==============================================================================
+set(MY_DEPS_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows")
 
-# 关联头文件与库
-target_include_directories(dongzhenmao PRIVATE ${INTERCEPTION_INCLUDE_DIR})
-target_link_libraries(dongzhenmao PRIVATE ${INTERCEPTION_LIB})
+# 声明全局头文件搜索路径
+# 注：通过此行设置后，【库 4】nlohmann/json 即可在代码中直接 `#include <nlohmann/json.hpp>` 使用，无需链接 .lib
+include_directories("${MY_DEPS_DIR}/include")
 
-# 提示：运行生成的程序时，确保项目输出目录下有 interception.dll
-# 如果配置了 vcpkg 集成，vcpkg 会自动将 vcpkg_installed/x64-windows/bin 中的 dll 拷贝到可执行文件同级目录。
+# ==============================================================================
+#  3. 寻找外部链接库 (.lib) - Release 版本
+# ==============================================================================
+
+# 【库 1】Interception
+find_library(INTERCEPTION_LIB interception PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
+
+# 【库 2】OpenCV (4.10.0 world 架构)
+find_library(OPENCV_LIB opencv_world4100 PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
+
+# 【库 3】ONNX Runtime
+find_library(ONNX_LIB onnxruntime PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
+
+# ==============================================================================
+#  4. 【库 5】构建 Dear ImGui 静态链接库 (本地源码直接编译)
+# ==============================================================================
+# 声明 ImGui 的核心文件及对应后端文件
+# 此处默认启用最常用的 [Win32 窗口 + DirectX11] 绘图后端，您可以根据需要调整
+set(IMGUI_SOURCES
+    "${MY_DEPS_DIR}/include/imgui/imgui.cpp"
+    "${MY_DEPS_DIR}/include/imgui/imgui_draw.cpp"
+    "${MY_DEPS_DIR}/include/imgui/imgui_widgets.cpp"
+    "${MY_DEPS_DIR}/include/imgui/imgui_tables.cpp"
+    "${MY_DEPS_DIR}/include/imgui/imgui_demo.cpp"
+    # 后端文件
+    "${MY_DEPS_DIR}/include/imgui/backends/imgui_impl_win32.cpp"
+    "${MY_DEPS_DIR}/include/imgui/backends/imgui_impl_dx11.cpp"
+    
+    # 若后期打算换用 [GLFW + OpenGL3] 绘图方案，请取消注释下方两行并注释掉 Win32/DX11 的那两行即可：
+    # "${MY_DEPS_DIR}/include/imgui/backends/imgui_impl_glfw.cpp"
+    # "${MY_DEPS_DIR}/include/imgui/backends/imgui_impl_opengl3.cpp"
+)
+
+# 构建一个名为 imgui_lib 的本地静态库
+add_library(imgui_lib STATIC ${IMGUI_SOURCES})
+
+# 告诉 imgui_lib 库查找其自身头文件的路径
+target_include_directories(imgui_lib PUBLIC 
+    "${MY_DEPS_DIR}/include/imgui"
+    "${MY_DEPS_DIR}/include/imgui/backends"
+)
+
+# ==============================================================================
+#  5. 创建您的可执行目标程序
+# ==============================================================================
+add_executable(main src/main.cpp)
+add_executable(main_find src/main_find.cpp)
+
+# ==============================================================================
+#  6. 循环配置链接库 + DLL 自动部署
+# ==============================================================================
+set(MY_PROJECT_TARGETS main main_find)
+
+foreach(tgt ${MY_PROJECT_TARGETS})
+    # 针对每个目标，链接对应的依赖库
+    target_link_libraries(${tgt} PRIVATE
+        # 链接本地编译的 ImGui 库
+        imgui_lib
+        
+        # 链接 Interception
+        ${INTERCEPTION_LIB}
+        
+        # 链接 OpenCV
+        ${OPENCV_LIB}
+        
+        # 链接 ONNX Runtime
+        ${ONNX_LIB}
+    )
+
+    # 在编译完成后，自动把所有必需的运行时 DLL 同步复制到 build/bin/ 可执行程序同级目录下
+    # 我们同时带上了 onnxruntime_providers_shared.dll，以防止因缺少底层依赖而在运行时抛出 LoadLibrary 126 错误
+    # add_custom_command(TARGET ${tgt} POST_BUILD
+    #     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    #         # 1. 拷贝 Interception.dll
+    #         "${MY_DEPS_DIR}/bin/interception.dll"
+            
+    #         # 2. 拷贝 OpenCV DLL
+    #         "${MY_DEPS_DIR}/bin/opencv_world4100.dll"
+
+    #         # 3. 拷贝 ONNX Runtime 主 DLL
+    #         "${MY_DEPS_DIR}/bin/onnxruntime.dll"
+            
+    #         # 4. 拷贝 ONNX Runtime 共享基础支撑 DLL
+    #         "${MY_DEPS_DIR}/bin/onnxruntime_providers_shared.dll"
+
+    #         # 5. 拷贝 ONNX Runtime CUDA 硬件加速提供者 DLL
+    #         "${MY_DEPS_DIR}/bin/onnxruntime_providers_cuda.dll"
+
+    #         # 自动获取可执行文件存放目录 (恒为 build/bin)
+    #         $<TARGET_FILE_DIR:${tgt}>
+    #     COMMENT "正在为目标 [${tgt}] 同步并部署动态库 DLL（已启用 GPU 部署）至 ${BASE_OUT_DIR}..."
+    # )
+    
+endforeach()
