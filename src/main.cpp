@@ -1,1129 +1,819 @@
+#define NOMINMAX // 阻止 Windows 头文件注入破坏 std::min
 #include "scancode.hpp"
 #include "my_algorithm.hpp"
 
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <thread>
 #include <mutex>
-#include <string>
-#include <vector>
-#include <algorithm>
-#include <condition_variable>
+#include <chrono>
 #include <atomic>
-#include <sstream>
-#include <coroutine> // 防止实验性协程断言阻断
+#include <vector>
+#include <string>
+#include <algorithm>
 
-// C++/WinRT 投影头文件
-#include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.System.h>
-#include <winrt/Windows.Graphics.Capture.h>
-#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+// 移除了 interception.h 依赖
+#include <windows.h>
+#include <nlohmann/json.hpp>
 
-// COM 互操作与图形头文件
-#include <windows.graphics.capture.interop.h>
-#include <windows.graphics.directx.direct3d11.interop.h>
-#include <d3d11.h>
-#include <dxgi1_2.h>
-
-// 🎯 DWM 用于窗口透明
-#include <dwmapi.h>
-#pragma comment(lib, "dwmapi.lib")
-
-// OpenCV 4 头文件
-#include <opencv2/opencv.hpp>
-
-// ONNX Runtime 头文件
-#include <onnxruntime_cxx_api.h>
-
-// Dear ImGui 头文件及后端
+// ImGui 及图形 API 依赖
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
+#include <d3d11.h>
+#include <tchar.h>
 
-// 🎯 Interception 驱动级输入库
-#include <interception.h>
-#pragma comment(lib, "interception.lib")
-
-// 自动链接库
-#pragma comment(lib, "windowsapp")
 #pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "user32.lib")
-
-// 声明 ImGui 的 Win32 消息处理函数
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // ==========================================
-// YOLO26-Pose 结构体与全局变量
+// 数据结构与槽位定义
 // ==========================================
-const std::vector<std::pair<int, int>> SKELETON_CONNECTIONS = {
-    {0, 1}, {0, 2}, {1, 3}, {2, 4},           // 脸部
-    {5, 6}, {5, 7}, {7, 9}, {6, 8}, {8, 10},  // 双臂
-    {11, 12}, {5, 11}, {6, 12},               // 躯干
-    {11, 13}, {13, 15}, {12, 14}, {14, 16}    // 双腿
+struct WeaponSlot {
+    std::string file_name = "None";
+    std::string weapon_name = "None";
+    std::vector<mtd::point2d> raw_pattern;
+    std::vector<mtd::point2i> pattern;
+    float fire_rate = 10.0f;
+    int delay_ms = 0;
+    float hr = 1.0f;
+    float vr = 1.0f;
 };
 
-struct Keypoint {
-    float x;
-    float y;
-    float confidence;
-};
+// 对应三个槽位：0: 主武器, 1: 副武器, 2: 手枪
+WeaponSlot slots[3]; 
 
-struct PoseDetection {
-    cv::Rect2f box;
-    float score;
-    int classId;
-    std::vector<Keypoint> keypoints;
-};
+// 当前激活的槽位：-1 为未开启/刀（关闭）, 0: 主武器, 1: 副武器, 2: 手枪
+std::atomic<int> active_slot{-1}; 
 
 // ==========================================
-// 模块 1: 通用工具箱 (Utils)
+// 新增：标准的串口物理硬件通信类
 // ==========================================
-namespace Utils {
-    HWND FindWindowByTitleKeywords(const std::vector<std::string>& keywords) {
-        for (HWND hwnd = GetTopWindow(NULL); hwnd != NULL; hwnd = GetWindow(hwnd, GW_HWNDNEXT)) {
-            if (IsWindowVisible(hwnd)) {
-                char title[512];
-                if (GetWindowTextA(hwnd, title, sizeof(title)) > 0) {
-                    std::string titleStr(title);
-                    for (const auto& keyword : keywords) {
-                        if (titleStr.find(keyword) != std::string::npos) {
-                            return hwnd;
-                        }
-                    }
-                }
-            }
+class SerialHardware {
+    HANDLE hSerial = INVALID_HANDLE_VALUE;
+public:
+    bool connect(const std::string& port) {
+        close();
+        std::string fullPort = "\\\\.\\" + port; // 兼容 COM10 以上端口
+        hSerial = CreateFileA(fullPort.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hSerial == INVALID_HANDLE_VALUE) return false;
+
+        DCB dcbSerialParams = { 0 };
+        dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+        if (!GetCommState(hSerial, &dcbSerialParams)) {
+            close();
+            return false;
         }
-        return nullptr;
+        dcbSerialParams.BaudRate = CBR_115200;
+        dcbSerialParams.ByteSize = 8;
+        dcbSerialParams.StopBits = ONESTOPBIT;
+        dcbSerialParams.Parity = NOPARITY;
+        if (!SetCommState(hSerial, &dcbSerialParams)) {
+            close();
+            return false;
+        }
+
+        COMMTIMEOUTS timeouts = { 0 };
+        timeouts.ReadIntervalTimeout = 50;
+        timeouts.ReadTotalTimeoutConstant = 50;
+        timeouts.ReadTotalTimeoutMultiplier = 10;
+        timeouts.WriteTotalTimeoutConstant = 50;
+        timeouts.WriteTotalTimeoutMultiplier = 10;
+        SetCommTimeouts(hSerial, &timeouts);
+
+        return true;
+    }
+
+    void move(int x, int y) {
+        if (hSerial == INVALID_HANDLE_VALUE) return;
+        std::string cmd = std::to_string(x) + "," + std::to_string(y) + "\n";
+        DWORD written;
+        WriteFile(hSerial, cmd.c_str(), (DWORD)cmd.length(), &written, NULL);
+    }
+
+    bool isOpen() const { return hSerial != INVALID_HANDLE_VALUE; }
+    void close() {
+        if (hSerial != INVALID_HANDLE_VALUE) {
+            CloseHandle(hSerial);
+            hSerial = INVALID_HANDLE_VALUE;
+        }
+    }
+    ~SerialHardware() { close(); }
+};
+
+SerialHardware g_hw;
+bool use_hardware = false; // 是否启用物理硬件模式
+std::string com_port = "COM3";
+char com_buf[16] = "COM3";
+
+// ==========================================
+// 系统配置与按键映射 (升级为标准 Virtual Keys 键码)
+// ==========================================
+struct Hotkeys {
+    int toggle_macro = VK_F8;
+    int reload_config = VK_F9;
+    int exit_app = VK_F7;
+    int primary = '1';
+    int secondary = '2';
+    int melee = '3';   
+    int pistol = '4';  
+} hotkeys;
+
+// 线程与同步控制
+std::atomic<bool> is_firing{false};
+std::atomic<bool> is_running{true};
+std::atomic<bool> is_open{false};
+std::mutex data_mutex;
+
+std::vector<std::string> weapon_files; 
+
+// 按键绑定状态管理
+std::atomic<bool> binding_mode{false};
+int* target_bind = nullptr; 
+
+// 边缘触发状态辅助数据结构
+struct KeyState {
+    bool is_down = false;
+    bool pressed = false; 
+};
+KeyState keys_state[256];
+
+void update_keys() {
+    for (int vk = 1; vk < 256; ++vk) {
+        bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        keys_state[vk].pressed = (down && !keys_state[vk].is_down);
+        keys_state[vk].is_down = down;
     }
 }
 
 // ==========================================
-// 模块 2: 异步多线程透明悬浮覆层类
+// 文件 IO 操作
 // ==========================================
-class WindowOverlay {
-public:
-    WindowOverlay(HWND targetHwnd) : m_targetHwnd(targetHwnd) {
-        WNDCLASSEXA wc = { sizeof(WNDCLASSEXA) };
-        wc.lpfnWndProc = WndProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.lpszClassName = "OverlayViewerClass";
-        RegisterClassExA(&wc);
-        
-        m_viewerHwnd = CreateWindowExA(
-            WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
-            "OverlayViewerClass", "YOLO26-Pose Overlay",
-            WS_POPUP,
-            0, 0, 100, 100,
-            nullptr, nullptr, wc.hInstance, this
-        );
 
-        SetLayeredWindowAttributes(m_viewerHwnd, 0, 255, LWA_ALPHA);
-
-        MARGINS margins = { -1, -1, -1, -1 };
-        DwmExtendFrameIntoClientArea(m_viewerHwnd, &margins);
-    }
-
-    int is_running = true, is_chasing;
-
-    void Start() {
-        std::cout << "初始化 D3D11 设备与渲染资源...\n";
-        InitGraphics();
-
-        std::cout << "初始化 ImGui 环境...\n";
-        InitImGui();
-
-        std::cout << "初始化 YOLO26-Pose ONNX 引擎...\n";
-        InitYOLO();
-
-        // 🎯 优化：启动独立的后台推理工作线程
-        m_workerRunning = true;
-        m_workerThread = std::thread(&WindowOverlay::WorkerThreadLoop, this);
-
-        // 🎯 新增：启动独立的 Interception 驱动按键检测线程
-        m_inputRunning = true;
-        m_inputThread = std::thread(&WindowOverlay::InputThreadLoop, this);
-
-        std::thread function(&WindowOverlay::recoil_controller, this);
-
-        std::cout << "启动窗口捕获...\n";
-        StartCapture();
-
-        ShowWindow(m_viewerHwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(m_viewerHwnd);
-
-        MSG msg;
-        ZeroMemory(&msg, sizeof(msg));
-        while (msg.message != WM_QUIT) {
-            if (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessageA(&msg);
-                continue;
-            }
-
-            UpdateOverlayPosition();
-            RenderFrame();
-            if (roi_change.x != -1) {
-                roi = roi_change;
-                roi_change = {-1, -1};
-            }
-
-            // 🎯 核心优化 1：彻底删除这里的 sleep_for 延迟！
-            // 因为 RenderFrame() 内部最后的 Present(1, 0) 是开启硬件垂直同步（VSync）的
-            // 它已经是一个硬件级、极度精准的线程休眠阻断。这里如果保留 sleep 会严重干扰系统调度，造成掉帧和极强滞后感。
-        }
-
-        is_running = false;
-
-        std::cout << "正在清理资源退出...\n";
-        StopCapture();
-
-        if (function.joinable()) function.join();
-
-        // 🎯 新增：关闭 Interception 上下文以安全解除按键线程的阻塞
-        if (m_interceptionContext) {
-            interception_destroy_context(m_interceptionContext);
-            m_interceptionContext = nullptr;
-        }
-        m_inputRunning = false;
-        if (m_inputThread.joinable()) {
-            m_inputThread.join();
-        }
-
-        // 优化：平滑退出后台推理线程
-        {
-            std::lock_guard<std::mutex> lock(m_workerMutex);
-            m_workerRunning = false;
-            m_workerCv.notify_one();
-        }
-        if (m_workerThread.joinable()) {
-            m_workerThread.join();
-        }
-
-        CleanupImGui();
-    }
-
-private:
-    struct TargetOffset {
-        int w, h;
-        float dx = 0.0f;       // 距离准星水平偏移（像素）
-        float dy = 0.0f;       // 距离准星垂直偏移（像素）
-        float distance = 0.0f; // 真实的欧氏距离（像素）
-        bool found = false;    // 是否成功寻找到目标
-    };
-
-    // 🎯 获取距离准星最近的头部相对坐标
-    TargetOffset GetClosestHeadOffset(
-        const std::vector<PoseDetection>& detections, 
-        int clientW, 
-        int clientH, 
-        int offsetX, 
-        int offsetY,
-        float confidence_threshold = 0.5f
-    ) {
-        TargetOffset bestTarget;
-        
-        // 安全防护
-        if (detections.empty() || clientW <= 1 || clientH <= 1) {
-            return bestTarget;
-        }
-
-        // 1. 计算游戏准星中心点
-        float centerX = clientW / 2.0f;
-        float centerY = clientH / 2.0f;
-        
-        // 初始化最小距离平方为最大浮点数
-        float minDistanceSq = std::numeric_limits<float>::max(); 
-
-        // 2. 遍历所有检测到的人
-        for (const auto& det : detections) {
-            
-            // 调用我们之前定义的 GetHeadCenter 获取头部中心
-            Point2D head = GetHeadCenter(det, confidence_threshold);
-            if (!head.valid) {
-                continue;
-            }
-
-            // 3. 转换到游戏画面内部坐标
-            float head_cx = head.x - offsetX;
-            float head_cy = head.y - offsetY;
-
-            // 4. 计算当前头部相对于准星中心的相对距离
-            float dx = head_cx - centerX;
-            float dy = head_cy - centerY;
-
-            // 🎯 优化：使用距离平方 (dx^2 + dy^2) 进行大小对比，免去 sqrt 的性能开销
-            float distSq = dx * dx + dy * dy;
-
-            // 5. 寻找最近的目标
-            if (distSq < minDistanceSq) {
-                minDistanceSq = distSq;
-                bestTarget.dx = dx;
-                bestTarget.dy = dy;
-                bestTarget.w = det.box.width;
-                bestTarget.h = det.box.height;
-                bestTarget.distance = std::sqrt(distSq); // 仅在确定是最近目标时才算一次开方
-                bestTarget.found = true;
-            }
-        }
-
-        return bestTarget;
-    }
-    
-    InterceptionDevice mouse_device = 12;
-    InterceptionDevice keyboard_device = 4;
-
-    void recoil_controller() {
-        while (is_running) {
-            if (is_chasing) {
-                std::cout << "[Controller] 动态自适应追踪启动...\n";
-                while (is_chasing) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(12));
-
-                    std::vector<PoseDetection> currentDetections; 
-                    {
-                        std::lock_guard<std::mutex> lock(m_detectionsMutex);
-                        currentDetections = m_sharedDetections;
-                    }
-                    
-                    int offsetX, offsetY, clientW, clientH;
-                    get_wh(offsetX, offsetY, clientW, clientH);
-                    TargetOffset target = GetClosestHeadOffset(currentDetections, clientW, clientH, offsetX, offsetY);
-
-                    // 🎯 优化 1：一旦丢失目标，立刻“瞬间拉满视野”到 640x640，重新大范围捕捉！
-                    // 彻底避免慢慢变大导致空档期锁定到“路人”身上。
-                    if (target.found == false) {
-                        roi_change = {640, 640};
-                        continue;
-                    }
-
-                    // 🎯 优化 2：基于严谨几何学计算 ROI（半径必须包容 |dx| + w/2）
-                    // opt = 2 * |dx| + w + 额外安全缓冲
-                    int opt_w = 2 * std::abs(target.dx) + target.w + 60;
-                    int opt_h = 2 * std::abs(target.dy) + target.h + 60;
-                    int opt = std::max(opt_w, opt_h);
-
-                    // 🎯 优化 3：限制安全区间 [320, 640]
-                    // 320 能够保证放大 2 倍时画质依然清晰，且留下足够宽敞的后坐力/移动缓冲带，绝不丢标。
-                    opt = std::clamp(opt, 320, 640);
-                    roi_change = {opt, opt};
-
-                    // 🎯 优化 4：使用手感极佳的平滑对称舍入鼠标控制
-                    float speed_factor = 0.15f; // 平滑平移速度系数
-                    float rx = target.dx * speed_factor;
-                    float ry = target.dy * speed_factor;
-
-                    int move_x = 0;
-                    int move_y = 0;
-
-                    if (std::abs(rx) > 0.01f) {
-                        move_x = static_cast<int>(std::round(rx));
-                        if (move_x == 0) move_x = (rx > 0) ? 1 : -1; // 1 像素强制微调
-                    }
-                    if (std::abs(ry) > 0.01f) {
-                        move_y = static_cast<int>(std::round(ry));
-                        if (move_y == 0) move_y = (ry > 0) ? 1 : -1;
-                    }
-
-                    InterceptionMouseStroke move = {};
-                    move.flags = INTERCEPTION_MOUSE_MOVE_RELATIVE;
-                    move.x = move_x;
-                    move.y = move_y;
-
-                    interception_send(m_interceptionContext, mouse_device, (InterceptionStroke*)&move, 1);
+void scan_data_folder() {
+    weapon_files.clear();
+    weapon_files.push_back("None"); 
+    try {
+        std::filesystem::create_directories("config/data");
+        for (const auto& entry : std::filesystem::directory_iterator("config/data")) {
+            if (entry.is_regular_file()) {
+                std::string ext = entry.path().extension().string();
+                if (ext == ".json" || ext == ".txt") {
+                    weapon_files.push_back(entry.path().filename().string());
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(15));
         }
+    } catch (...) {
+        std::cerr << "[Error] Failed to scan config/data folder\n";
     }
+}
 
-    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-        if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
-            return true;
-
-        WindowOverlay* viewer = nullptr;
-        if (msg == WM_NCCREATE) {
-            CREATESTRUCTA* pCreate = reinterpret_cast<CREATESTRUCTA*>(lParam);
-            viewer = reinterpret_cast<WindowOverlay*>(pCreate->lpCreateParams);
-            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(viewer));
-        } else {
-            viewer = reinterpret_cast<WindowOverlay*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-        }
-
-        if (viewer) {
-            switch (msg) {
-                case WM_SIZE:
-                    viewer->OnResize(LOWORD(lParam), HIWORD(lParam));
-                    return 0;
-                case WM_DESTROY:
-                    PostQuitMessage(0);
-                    return 0;
-            }
-        }
-
-        return DefWindowProcA(hwnd, msg, wParam, lParam);
+void apply_ratios_to_slot(int slot_idx) {
+    std::lock_guard<std::mutex> lock(data_mutex);
+    slots[slot_idx].pattern.clear();
+    for (const auto& p : slots[slot_idx].raw_pattern) {
+        slots[slot_idx].pattern.push_back(mtd::point2i({
+            static_cast<int>(p.x * slots[slot_idx].hr),
+            static_cast<int>(p.y * slots[slot_idx].vr)
+        }));
     }
+}
 
-    void UpdateOverlayPosition() {
-        if (!IsWindow(m_targetHwnd)) {
-            std::cout << "目标播放器窗口已关闭，准备退出...\n";
-            PostQuitMessage(0);
-            return;
-        }
-
-        // 1. 获取当前系统正处于最前端激活（Focused）的窗口句柄
-        HWND activeHwnd = GetForegroundWindow();
-        
-        // 2. 判定：只有当活跃窗口是“游戏窗口”或“我们自己的覆层”时，才视为聚焦在游戏上
-        bool isFocused = (activeHwnd == m_targetHwnd || activeHwnd == m_viewerHwnd);
-
-        // 3. 如果没聚焦在游戏上，或者游戏被最小化了，则彻底隐身，不干涉其它软件
-        if (!isFocused || IsIconic(m_targetHwnd) || !IsWindowVisible(m_targetHwnd)) {
-            ShowWindow(m_viewerHwnd, SW_HIDE);
-        } 
-        else {
-            // 4. 只有聚焦在游戏上时，才显示悬浮窗并进行位置对齐
-            ShowWindow(m_viewerHwnd, SW_SHOWNOACTIVATE);
-
-            RECT rect;
-            GetClientRect(m_targetHwnd, &rect);
-            
-            POINT topLeft = { rect.left, rect.top };
-            ClientToScreen(m_targetHwnd, &topLeft);
-
-            int w = rect.right - rect.left;
-            int h = rect.bottom - rect.top;
-
-            // 保持吸附并置顶（因为此时游戏就在前台，所以置顶表现为刚好贴在游戏表面）
-            SetWindowPos(m_viewerHwnd, HWND_TOPMOST, topLeft.x, topLeft.y, w, h, SWP_NOACTIVATE);
-        }
-    }
-
-    void InitGraphics() {
-        winrt::com_ptr<ID3D11Device> d3dDevice;
-        winrt::com_ptr<ID3D11DeviceContext> d3dContext;
-        winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, 
-            d3dDevice.put(), nullptr, d3dContext.put()));
-        
-        d3dDevice.as<ID3D10Multithread>()->SetMultithreadProtected(TRUE);
-        m_d3dDevice = d3dDevice;
-        m_d3dContext = d3dContext;
-
-        winrt::com_ptr<IInspectable> inspectableDevice;
-        winrt::check_hresult(
-            CreateDirect3D11DeviceFromDXGIDevice(d3dDevice.as<IDXGIDevice>().get(), inspectableDevice.put())
-        );
-        m_winrtDevice = inspectableDevice.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
-
-        winrt::com_ptr<IDXGIAdapter> adapter;
-        d3dDevice.as<IDXGIDevice>()->GetAdapter(adapter.put());
-        winrt::com_ptr<IDXGIFactory> dxgiFactory;
-        adapter->GetParent(winrt::guid_of<IDXGIFactory>(), dxgiFactory.put_void());
-
-        RECT rect;
-        GetClientRect(m_viewerHwnd, &rect);
-
-        DXGI_SWAP_CHAIN_DESC desc = {};
-        desc.BufferDesc.Width = std::max<LONG>(1, rect.right - rect.left);
-        desc.BufferDesc.Height = std::max<LONG>(1, rect.bottom - rect.top);
-        desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.BufferDesc.RefreshRate.Numerator = 60;
-        desc.BufferDesc.RefreshRate.Denominator = 1;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 1;
-        desc.OutputWindow = m_viewerHwnd;
-        desc.Windowed = TRUE;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-        winrt::com_ptr<IDXGISwapChain> swapChain;
-        winrt::check_hresult(dxgiFactory->CreateSwapChain(d3dDevice.get(), &desc, swapChain.put()));
-        
-        m_swapChain = swapChain.as<IDXGISwapChain1>();
-        
-        UpdateRenderTarget();
-    }
-
-    void UpdateRenderTarget() {
-        m_rtv = nullptr;
-        winrt::com_ptr<ID3D11Texture2D> backBuffer;
-        winrt::check_hresult(m_swapChain->GetBuffer(0, winrt::guid_of<ID3D11Texture2D>(), backBuffer.put_void()));
-        winrt::check_hresult(m_d3dDevice->CreateRenderTargetView(backBuffer.get(), nullptr, m_rtv.put()));
-    }
-
-    void OnResize(int w, int h) {
-        if (m_swapChain && w > 0 && h > 0) {
-            m_rtv = nullptr;
-            m_swapChain->ResizeBuffers(1, w, h, DXGI_FORMAT_UNKNOWN, 0);
-            UpdateRenderTarget();
-        }
-    }
-
-    void InitImGui() {
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO(); (void)io;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        
-        ImGui::StyleColorsDark();
-
-        ImGui_ImplWin32_Init(m_viewerHwnd);
-        ImGui_ImplDX11_Init(m_d3dDevice.get(), m_d3dContext.get());
-    }
-
-    void CleanupImGui() {
-        ImGui_ImplDX11_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-    }
-
-    void InitYOLO() {
-        try {
-            m_ortEnv = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "YOLO26-Pose");
-            Ort::SessionOptions session_options;
-            session_options.SetIntraOpNumThreads(1); // 🎯 GPU 模式下，CPU 辅助线程设为 1 即可，防止过多的 CPU 上下文切换导致延迟
-            session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
-            std::vector<std::string> available_providers = Ort::GetAvailableProviders();
-            auto cuda_it = std::find(available_providers.begin(), available_providers.end(), "CUDAExecutionProvider");
-            
-            if (cuda_it != available_providers.end()) {
-                OrtCUDAProviderOptions cuda_options;
-                cuda_options.device_id = 0;
-                cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic; // 🎯 优化为启发式搜索，减少初次加载卡顿
-                cuda_options.gpu_mem_limit = SIZE_MAX;
-                // 开启 ONNX Runtime 自带的底层优化
-                session_options.AppendExecutionProvider_CUDA(cuda_options);
-                session_options.AddConfigEntry("enable_cuda_graph", "1"); // 🎯 启用 CUDA Graph 减少 CPU-GPU 调度开销
-                std::cout << "[YOLO] 成功启用 CUDA 并开启极致延迟优化！\n";
-            } else {
-                std::cout << "[YOLO] 未检测到本地 GPU/CUDA 环境。已自动回退到 CPU 推理。\n";
-            }
-
-            const std::string model_path = "yolo26n-pose.onnx";
-#ifdef _WIN32
-            std::wstring model_path_w(model_path.begin(), model_path.end());
-            m_ortSession = std::make_unique<Ort::Session>(*m_ortEnv, model_path_w.c_str(), session_options);
-#else
-            m_ortSession = std::make_unique<Ort::Session>(*m_ortEnv, model_path.c_str(), session_options);
-#endif
-            auto input_name_ptr = m_ortSession->GetInputNameAllocated(0, m_ortAllocator);
-            auto output_name_ptr = m_ortSession->GetOutputNameAllocated(0, m_ortAllocator);
-            m_inputName = input_name_ptr.get();
-            m_outputName = output_name_ptr.get();
-            m_yoloInitialized = true;
-            std::cout << "YOLO26-Pose ONNX 引擎初始化成功!\n";
-        } catch (const std::exception& e) {
-            std::cerr << "YOLO26-Pose 加载失败: " << e.what() << "\n";
-            m_yoloInitialized = false;
-        }
-    }
-
-    bool CopyTextureToMat(ID3D11Texture2D* srcTexture, int width, int height, cv::Mat& outMat) {
-        D3D11_TEXTURE2D_DESC srcDesc;
-        srcTexture->GetDesc(&srcDesc);
-
-        bool recreate = false;
-        if (!m_stagingTexture) {
-            recreate = true;
-        } else {
-            D3D11_TEXTURE2D_DESC stageDesc;
-            m_stagingTexture->GetDesc(&stageDesc);
-            if (stageDesc.Width != srcDesc.Width || stageDesc.Height != srcDesc.Height) {
-                recreate = true;
-            }
-        }
-
-        if (recreate) {
-            D3D11_TEXTURE2D_DESC desc = srcDesc;
-            desc.BindFlags = 0;
-            desc.MiscFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            desc.Usage = D3D11_USAGE_STAGING;
-            HRESULT hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, m_stagingTexture.put());
-            if (FAILED(hr)) return false;
-        }
-
-        m_d3dContext->CopyResource(m_stagingTexture.get(), srcTexture);
-
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = m_d3dContext->Map(m_stagingTexture.get(), 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) return false;
-
-        cv::Mat bgraMat(srcDesc.Height, srcDesc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
-        
-        cv::Rect _roi(0, 0, width, height);
-        bgraMat(_roi).copyTo(outMat);
-
-        m_d3dContext->Unmap(m_stagingTexture.get(), 0);
+bool load_weapon_to_slot(int slot_idx, const std::string& file_name) {
+    if (file_name == "None" || file_name.empty()) {
+        std::lock_guard<std::mutex> lock(data_mutex);
+        slots[slot_idx].file_name = "None";
+        slots[slot_idx].weapon_name = "None";
+        slots[slot_idx].raw_pattern.clear();
+        slots[slot_idx].pattern.clear();
         return true;
     }
 
-    mtd::point2i roi{640, 640};
-    mtd::point2i roi_change{-1, -1};
+    std::string full_path = "config/data/" + file_name;
+    if (!std::filesystem::exists(full_path)) return false;
 
-    std::vector<PoseDetection> ProcessYOLO(const cv::Mat &src_img) {
-        std::vector<PoseDetection> detections;
-        if (!m_yoloInitialized || src_img.empty()) return detections;
+    try {
+        std::ifstream fin(full_path);
+        nlohmann::json j = nlohmann::json::parse(fin);
 
-        int img_w = src_img.cols;
-        int img_h = src_img.rows;
+        std::lock_guard<std::mutex> lock(data_mutex);
+        slots[slot_idx].file_name = file_name;
+        slots[slot_idx].weapon_name = j.value("name", "Unknown");
+        slots[slot_idx].delay_ms = int(j.value("delay", 0.0) * 1000);
+        slots[slot_idx].fire_rate = j.value("fire_rate", 10.0f);
+        slots[slot_idx].hr = j.value("horizontal_ratio", 1.0f);
+        slots[slot_idx].vr = j.value("vertical_ratio", 1.0f);
+        slots[slot_idx].raw_pattern = j["spray_pattern"].get<std::vector<mtd::point2d>>();
         
-        // 1. 计算中心 roi_w * roi_h 区域的裁剪偏移量（以屏幕/游戏中心为锚点）
-        auto [_roi_w, _roi_h] = roi;
-
-        int crop_x = std::max(0, (img_w - _roi_w) / 2);
-        int crop_y = std::max(0, (img_h - _roi_h) / 2);
-        
-        // 边界安全防护，防止低分辨率下越界
-        _roi_w = std::min(_roi_w, img_w - crop_x);
-        _roi_h = std::min(_roi_h, img_h - crop_y);
-
-        // 2. 🎯 直接裁剪出中心画面，无需 Letterbox
-        cv::Rect roi_rect(crop_x, crop_y, _roi_w, _roi_h);
-        cv::Mat cropped_img = src_img(roi_rect);
-
-        // 3. 将 1:1 裁剪的高清画面打包成 Tensor
-        // 🎯 优化：当尺寸本就是 640*640 时（最普遍情况），Size() 传入空，防止 OpenCV 内部进行多余的 Resize
-        cv::Size blob_size = (cropped_img.cols == 640 && cropped_img.rows == 640) ? cv::Size() : cv::Size(640, 640);
-        cv::Mat blob = cv::dnn::blobFromImage(cropped_img, 1.0 / 255.0, blob_size, cv::Scalar(0, 0, 0), true, false, CV_32F);
-
-        std::vector<int64_t> input_shape = {1, 3, 640, 640};
-        Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        
-        try {
-            Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-                memory_info, 
-                (float*)blob.data, 
-                blob.total() * blob.channels(), 
-                input_shape.data(), 
-                input_shape.size()
-            );
-
-            const char* input_name = m_inputName.c_str();
-            const char* output_name = m_outputName.c_str();
-
-            auto output_tensors = m_ortSession->Run(
-                Ort::RunOptions{nullptr}, 
-                &input_name, 
-                &input_tensor, 
-                1, 
-                &output_name, 
-                1
-            );
-
-            float* raw_output = output_tensors[0].GetTensorMutableData<float>();
-            auto output_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
-            int num_predictions = output_shape[1]; // 300
-            int num_elements = output_shape[2];    // 57
-
-            // 计算缩放比（以防在极端低分辨率屏幕上 roi 被迫缩小）
-            float scale_x = (float)cropped_img.cols / 640.0f;
-            float scale_y = (float)cropped_img.rows / 640.0f;
-
-            for (int i = 0; i < num_predictions; ++i) {
-                float* data_ptr = raw_output + i * num_elements;
-                float x1 = data_ptr[0];
-                float y1 = data_ptr[1];
-                float x2 = data_ptr[2];
-                float y2 = data_ptr[3];
-                float confidence = data_ptr[4];
-                int class_id = (int)data_ptr[5];
-
-                if (confidence < 0.5f) { 
-                    continue;
-                }
-
-                // 🎯 还原坐标：先还原到裁剪区比例，然后加上 X 和 Y 的偏移量还原到整个屏幕
-                float orig_x1 = x1 * scale_x + crop_x;
-                float orig_y1 = y1 * scale_y + crop_y;
-                float orig_x2 = x2 * scale_x + crop_x;
-                float orig_y2 = y2 * scale_y + crop_y;
-
-                PoseDetection det;
-                det.box = cv::Rect2f(orig_x1, orig_y1, orig_x2 - orig_x1, orig_y2 - orig_y1);
-                det.score = confidence;
-                det.classId = class_id;
-
-                det.keypoints.resize(17);
-                for (int k = 0; k < 17; ++k) {
-                    float kpt_x = data_ptr[6 + k * 3];
-                    float kpt_y = data_ptr[6 + k * 3 + 1];
-                    float kpt_conf = data_ptr[6 + k * 3 + 2];
-                    
-                    // 同理，加上中心偏移量
-                    det.keypoints[k].x = kpt_x * scale_x + crop_x;
-                    det.keypoints[k].y = kpt_y * scale_y + crop_y;
-                    det.keypoints[k].confidence = kpt_conf;
-                }
-                detections.push_back(det);
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Inference error: " << e.what() << "\n";
+        slots[slot_idx].pattern.clear();
+        for (const auto& p : slots[slot_idx].raw_pattern) {
+            slots[slot_idx].pattern.push_back(mtd::point2i({
+                static_cast<int>(p.x * slots[slot_idx].hr),
+                static_cast<int>(p.y * slots[slot_idx].vr)
+            }));
         }
-
-        return detections;
+        return true;
+    } catch (...) {
+        return false;
     }
+}
 
-    struct Point2D {
-        float x = 0.0f;
-        float y = 0.0f;
-        bool valid = false;
-    };
-
-    // 🎯 计算头部的物理中心点（带背向遮挡自动兜底）
-    Point2D GetHeadCenter(const PoseDetection& det, float confidence_threshold = 0.5f) {
-        float sum_x = 0.0f;
-        float sum_y = 0.0f;
-        int count = 0;
-
-        // COCO 头部关键点索引: 0(鼻), 1(左眼), 2(右眼), 3(左耳), 4(右耳)
-        for (int i = 0; i <= 4; ++i) {
-            if (det.keypoints[i].confidence > confidence_threshold) {
-                sum_x += det.keypoints[i].x;
-                sum_y += det.keypoints[i].y;
-                count++;
-            }
-        }
-
-        Point2D head;
-        if (count > 0) {
-            // 1. 如果有可见的关键点，求均值作为头部中心点
-            head.x = sum_x / count;
-            head.y = sum_y / count;
-            head.valid = true;
-        } else {
-            // 2. 兜底方案：如果全部遮挡（如背对镜头），使用检测框顶部向下 12% 处作为近似头部
-            head.x = det.box.x + det.box.width / 2.0f;
-            head.y = det.box.y + det.box.height * 0.14f; 
-            head.valid = true;
-        }
-        return head;
-    }
-
-    void StartCapture() {
-        auto factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-        winrt::check_hresult(
-            factory->CreateForWindow(m_targetHwnd, winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(), winrt::put_abi(m_item))
-        );
-
-        auto size = m_item.Size();
-
-        m_framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            m_winrtDevice, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
-        
-        m_frameArrivedToken = m_framePool.FrameArrived({ this, &WindowOverlay::OnFrameArrived });
-        
-        m_session = m_framePool.CreateCaptureSession(m_item);
-        m_session.StartCapture();
-    }
-
-    void StopCapture() {
-        if (m_session) m_session.Close();
-        if (m_framePool) {
-            m_framePool.FrameArrived(m_frameArrivedToken);
-            m_framePool.Close();
-        }
-    }
-
-    // 🎯 核心优化 2：解决 WGC 帧池积压引起的延迟积累问题
-    void OnFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender, 
-        winrt::Windows::Foundation::IInspectable const&) {
-        
-        winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latestFrame{ nullptr };
-
-        // 使用快速 While 循环，直接“榨干”丢弃当前缓冲区里的所有历史积压旧帧，只保留最新的一帧
-        // 这能瞬间解决因游戏大作的高 FPS 导致的捕获队列积压滞后
-        while (auto frame = sender.TryGetNextFrame()) {
-            latestFrame = frame;
-        }
-
-        if (!latestFrame) return;
-
-        auto contentSize = latestFrame.ContentSize();
-
-        auto access = latestFrame.Surface().as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-        winrt::com_ptr<ID3D11Texture2D> frameTexture;
-        winrt::check_hresult(access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), frameTexture.put_void()));
-
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_pendingTexture = frameTexture;
-        m_pendingWidth = contentSize.Width;
-        m_pendingHeight = contentSize.Height;
-    }
-
-    // 🎯 优化：运行 OpenCV 预处理和 YOLO ONNX 推理的后台工作线程循环
-    void WorkerThreadLoop() {
-        while (m_workerRunning) {
-            cv::Mat frame;
-            int width = 0, height = 0;
-
-            {
-                std::unique_lock<std::mutex> lock(m_workerMutex);
-                m_workerCv.wait(lock, [this]() { return !m_workerRunning || m_hasNewFrame; });
-                if (!m_workerRunning) break;
-
-                frame = std::move(m_frameToProcess);
-                width = m_processWidth;
-                height = m_processHeight;
-                m_hasNewFrame = false;
-            }
-
-            if (!frame.empty()) {
-                auto detections = ProcessYOLO(frame);
-
-                // 更新共享结果缓冲区
-                {
-                    std::lock_guard<std::mutex> lock(m_detectionsMutex);
-                    m_sharedDetections = std::move(detections);
-                    m_sharedWidth = width;
-                    m_sharedHeight = height;
-                }
-            }
-        }
-    }
-
-    void InputThreadLoop() {
-        m_interceptionContext = interception_create_context();
-        if (!m_interceptionContext) {
-            std::cerr << "[Interception] 无法启动驱动级键盘监听，请确保您已在系统正确安装了 Interception 驱动程序！\n";
-            return;
-        }
-
-        // 设置按键过滤器（只监听键盘按下事件，防止按键抬起时二次触发）
-        interception_set_filter(m_interceptionContext, interception_is_keyboard, INTERCEPTION_FILTER_KEY_ALL);
-
-        InterceptionDevice device;
-        InterceptionStroke stroke;
-
-        std::cout << "[Interception] 驱动级按键监听成功运行。按下 F8 键可切换 YOLO 裁剪识别区显示状态。\n";
-
-        while (m_inputRunning && (device = interception_wait(m_interceptionContext)) > 0) {
-            interception_receive(m_interceptionContext, device, &stroke, 1);
-            interception_send(m_interceptionContext, device, &stroke, 1);
-            if (interception_is_keyboard(device)) {
-                InterceptionKeyStroke &kstroke = *(InterceptionKeyStroke*)&stroke;
-                
-                if (kstroke.code == SCANCODE_F8 && kstroke.state == INTERCEPTION_KEY_DOWN) {
-                    m_showCropZone = !m_showCropZone.load(); // 切换状态
-                    std::cout << "[Interception] 检测到 F8 键按下，当前 YOLO 识别区方框显示状态: " 
-                                << (m_showCropZone.load() ? "开启" : "关闭") << "\n";
-                }
-                if (kstroke.code == SCANCODE_F9 && kstroke.state == INTERCEPTION_KEY_DOWN) {
-                    if (roi.x != 640) {
-                        roi_change = {640, 640};
-                    } else if (roi.x != 320) {
-                        roi_change = {320, 320};
-                    }
-                }
-                if (kstroke.code == SCANCODE_F10 && kstroke.state == INTERCEPTION_KEY_DOWN) {
-                    is_chasing = !is_chasing;
-                    std::cout << is_chasing << "\n";
-                }
-            }
-
-        }
-    }
-
-    void get_wh(int &offsetX, int &offsetY, int &clientW, int &clientH) {
-        offsetX =offsetY = 0, clientW = clientH = 1;
-        if (IsWindow(m_targetHwnd)) {
-            RECT safeWindowRect;
-            HRESULT hr = DwmGetWindowAttribute(m_targetHwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &safeWindowRect, sizeof(safeWindowRect));
-
-            POINT clientTopLeft = { 0, 0 };
-            ClientToScreen(m_targetHwnd, &clientTopLeft); // 游戏内容区的左上角屏幕坐标
-
-            RECT clientRect;
-            GetClientRect(m_targetHwnd, &clientRect);
-            clientW = clientRect.right - clientRect.left;
-            clientH = clientRect.bottom - clientRect.top;
-
-            if (SUCCEEDED(hr)) {
-                // 用真实的物理可视边界计算偏差，完美消除 7~8 像素的偏左误差
-                offsetX = clientTopLeft.x - safeWindowRect.left;
-                offsetY = clientTopLeft.y - safeWindowRect.top;
-            } else {
-                // 备用方案（如果 DWM 读取失败，退回到普通获取）
-                RECT windowRect;
-                GetWindowRect(m_targetHwnd, &windowRect);
-                offsetX = clientTopLeft.x - windowRect.left;
-                offsetY = clientTopLeft.y - windowRect.top;
-            }
-        }
-    }
-
-    // 主线程轻量化绘制渲染
-    void RenderFrame() {
-        if (!m_rtv) return;
-
-        winrt::com_ptr<ID3D11Texture2D> newTexture; 
-        int updateWidth = 0, updateHeight = 0;
+void save_weapon_to_json(int slot_idx) {
+    if (slots[slot_idx].file_name == "None" || slots[slot_idx].file_name.empty()) return;
+    std::string full_path = "config/data/" + slots[slot_idx].file_name;
+    try {
+        nlohmann::json j;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_pendingTexture) {
-                newTexture = m_pendingTexture;
-                m_pendingTexture = nullptr;
-                updateWidth = m_pendingWidth;
-                updateHeight = m_pendingHeight;
+            std::lock_guard<std::mutex> lock(data_mutex);
+            j["name"] = slots[slot_idx].weapon_name;
+            j["delay"] = double(slots[slot_idx].delay_ms) / 1000.0;
+            j["fire_rate"] = slots[slot_idx].fire_rate;
+            j["horizontal_ratio"] = slots[slot_idx].hr;
+            j["vertical_ratio"] = slots[slot_idx].vr;
+            j["spray_pattern"] = slots[slot_idx].raw_pattern;
+        }
+        std::ofstream fout(full_path);
+        fout << j.dump(4);
+    } catch (...) {}
+}
+
+void load_global_config() {
+    std::filesystem::create_directories("config");
+    if (!std::filesystem::exists("config/config.json")) {
+        nlohmann::json j;
+        j["com_port"] = com_port;
+        j["use_hardware"] = use_hardware;
+
+        j["hotkeys"]["toggle_macro"] = hotkeys.toggle_macro;
+        j["hotkeys"]["reload_config"] = hotkeys.reload_config;
+        j["hotkeys"]["exit_app"] = hotkeys.exit_app;
+        j["hotkeys"]["primary"] = hotkeys.primary;
+        j["hotkeys"]["secondary"] = hotkeys.secondary;
+        j["hotkeys"]["melee"] = hotkeys.melee;
+        j["hotkeys"]["pistol"] = hotkeys.pistol;
+        std::ofstream fout("config/config.json");
+        fout << j.dump(4);
+        return;
+    }
+
+    try {
+        std::ifstream fin("config/config.json");
+        nlohmann::json j = nlohmann::json::parse(fin);
+
+        com_port = j.value("com_port", "COM3");
+        strcpy_s(com_buf, sizeof(com_buf), com_port.c_str());
+        use_hardware = j.value("use_hardware", false);
+
+        if (j.contains("hotkeys")) {
+            auto h = j["hotkeys"];
+            hotkeys.toggle_macro = h.value("toggle_macro", VK_F8);
+            hotkeys.reload_config = h.value("reload_config", VK_F9);
+            hotkeys.exit_app = h.value("exit_app", VK_F7);
+            hotkeys.primary = h.value("primary", '1');
+            hotkeys.secondary = h.value("secondary", '2');
+            hotkeys.melee = h.value("melee", '3');
+            hotkeys.pistol = h.value("pistol", '4');
+        }
+    } catch (...) {}
+}
+
+void save_global_config() {
+    try {
+        nlohmann::json j;
+        j["com_port"] = com_port;
+        j["use_hardware"] = use_hardware;
+
+        j["hotkeys"]["toggle_macro"] = hotkeys.toggle_macro;
+        j["hotkeys"]["reload_config"] = hotkeys.reload_config;
+        j["hotkeys"]["exit_app"] = hotkeys.exit_app;
+        j["hotkeys"]["primary"] = hotkeys.primary;
+        j["hotkeys"]["secondary"] = hotkeys.secondary;
+        j["hotkeys"]["melee"] = hotkeys.melee;
+        j["hotkeys"]["pistol"] = hotkeys.pistol;
+        std::ofstream fout("config/config.json");
+        fout << j.dump(4);
+    } catch (...) {}
+}
+
+void load_latest_weapons() {
+    if (!std::filesystem::exists("config/latest.json")) return;
+    try {
+        std::ifstream fin("config/latest.json");
+        nlohmann::json j = nlohmann::json::parse(fin);
+        load_weapon_to_slot(0, j.value("primary_weapon", "None"));
+        load_weapon_to_slot(1, j.value("secondary_weapon", "None"));
+        load_weapon_to_slot(2, j.value("pistol_weapon", "None"));
+    } catch (...) {}
+}
+
+void save_latest_weapons() {
+    try {
+        nlohmann::json j;
+        j["primary_weapon"] = slots[0].file_name;
+        j["secondary_weapon"] = slots[1].file_name;
+        j["pistol_weapon"] = slots[2].file_name;
+        std::ofstream fout("config/latest.json");
+        fout << j.dump(4);
+    } catch (...) {}
+}
+
+std::string get_key_name(int vk) {
+    switch (vk) {
+        case '1': return "1"; case '2': return "2";
+        case '3': return "3"; case '4': return "4";
+        case 'A': return "A"; case 'B': return "B"; case 'C': return "C";
+        case 'D': return "D"; case 'E': return "E"; case 'F': return "F";
+        case 'G': return "G"; case 'S': return "S"; case 'W': return "W";
+        case 'X': return "X"; case 'Z': return "Z";
+        case VK_F1: return "F1"; case VK_F2: return "F2";
+        case VK_F3: return "F3"; case VK_F4: return "F4";
+        case VK_F5: return "F5"; case VK_F6: return "F6";
+        case VK_F7: return "F7"; case VK_F8: return "F8";
+        case VK_F9: return "F9"; case VK_F10: return "F10";
+        case VK_ESCAPE: return "ESC";
+        case VK_LCONTROL: return "L-Ctrl"; case VK_LMENU: return "L-Alt";
+        case VK_LSHIFT: return "L-Shift"; case VK_SPACE: return "Space";
+        case VK_MBUTTON: return "Mouse 3";
+        case VK_XBUTTON1: return "Mouse 4";
+        case VK_XBUTTON2: return "Mouse 5";
+        default: return "VK " + std::to_string(vk);
+    }
+}
+
+// ==========================================
+// 线程 1: 压枪控制线程 (支持硬件串口输出)
+// ==========================================
+void recoil_controller() {
+    while (is_running) {
+        int current_slot = active_slot.load();
+        if (is_firing && current_slot >= 0 && current_slot < 3) {
+            std::vector<mtd::point2i> current_pattern;
+            float current_fire_rate;
+            std::chrono::milliseconds current_delay;
+            std::chrono::milliseconds current_fire_cycle;
+            {
+                std::lock_guard<std::mutex> lock(data_mutex);
+                current_pattern = slots[current_slot].pattern;
+                current_fire_rate = slots[current_slot].fire_rate;
+                current_delay = std::chrono::milliseconds(slots[current_slot].delay_ms);
+                current_fire_cycle = std::chrono::milliseconds(int(1000 / current_fire_rate));
+            }
+
+            if (!current_pattern.empty()) {
+                if (current_delay.count() > 0) std::this_thread::sleep_for(current_delay);
+                
+                mtd::point2i now_pos = {0, 0};
+                std::chrono::steady_clock::time_point _start = std::chrono::steady_clock::now();
+                std::chrono::milliseconds step_t(20);
+
+                while (is_firing && active_slot.load() == current_slot) {
+                    auto _now = std::chrono::steady_clock::now();
+                    auto now_t = std::chrono::duration_cast<std::chrono::milliseconds>(_now - _start); 
+                    
+                    int now_step = std::ceil(current_fire_rate * now_t.count() / 1000.0 + 0.05);
+                    if (now_step >= static_cast<int>(current_pattern.size())) break;
+
+                    mtd::point2i nx_spray_pos = current_pattern[now_step];
+                    std::chrono::milliseconds nx_t = current_fire_cycle * now_step;
+
+                    double remaining_time = (nx_t - now_t).count();
+                    double fraction = (remaining_time > 0.0 ? (std::min)(1.0, double(step_t.count()) / remaining_time) : 1.0);
+                    
+                    mtd::point2i we = mtd::point2d(nx_spray_pos - now_pos) * fraction;
+                    now_pos = now_pos + we;
+
+                    if (use_hardware && g_hw.isOpen()) {
+                        // 🎯 方案一：向 RP2040 发送物理移动数据包
+                        g_hw.move(-we.x, -we.y);
+                    } else {
+                        // 🎯 方案二：降级运行。由于完全卸载了 .sys，为了安全，请只保留硬件输出。
+                        // 这里默认不调用系统底层虚拟 API，保持绝对安全。
+                    }
+                    std::this_thread::sleep_for(step_t);
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// ==========================================
+// 线程 2: 纯用户态 GetAsyncKeyState 轮询线程
+// ==========================================
+void input_thread_loop() {
+    while (is_running) {
+        update_keys();
+
+        // 🎯 处于物理改键模式时
+        if (binding_mode.load() && target_bind != nullptr) {
+            for (int vk = 1; vk < 256; ++vk) {
+                // 排除左右鼠标键以免冲突
+                if (vk == VK_LBUTTON || vk == VK_RBUTTON) continue;
+
+                if (keys_state[vk].pressed) {
+                    *target_bind = vk;
+                    save_global_config();
+                    binding_mode = false;
+                    target_bind = nullptr;
+                    break;
+                }
+            }
+        } 
+        else {
+            // 🎯 处理全局热键与切枪按键响应
+            if (keys_state[hotkeys.toggle_macro].pressed) {
+                is_open = !is_open;
+                if (!is_open) is_firing = false;
+            } 
+            else if (keys_state[hotkeys.reload_config].pressed) {
+                scan_data_folder();
+                load_latest_weapons();
+            } 
+            else if (keys_state[hotkeys.exit_app].pressed) {
+                is_running = false;
+            } 
+            else if (keys_state[hotkeys.primary].pressed) {
+                active_slot = 0;
+            } 
+            else if (keys_state[hotkeys.secondary].pressed) {
+                active_slot = 1;
+            } 
+            else if (keys_state[hotkeys.melee].pressed) {
+                active_slot = -1;
+            } 
+            else if (keys_state[hotkeys.pistol].pressed) {
+                active_slot = 2;
             }
         }
 
-        // 极速 GPU -> CPU 内存提取
-        if (newTexture) {
-            bool worker_busy = false;
-            {
-                std::lock_guard<std::mutex> lock(m_workerMutex);
-                worker_busy = m_hasNewFrame; // 如果 m_hasNewFrame 为 true，说明上一帧还没处理完
+        // 🎯 处理开火同步状态检测
+        if (is_open.load() && active_slot.load() != -1) {
+            if (keys_state[VK_LBUTTON].is_down) {
+                is_firing = true;
+            } else {
+                is_firing = false;
             }
+        } else {
+            is_firing = false;
+        }
 
-            if (newTexture && !worker_busy) { // 只有后台空闲时，主线程才进行 GPU->CPU 拷贝
-                cv::Mat cpu_frame;
-                if (CopyTextureToMat(newTexture.get(), updateWidth, updateHeight, cpu_frame)) {
-                    {
-                        std::lock_guard<std::mutex> lock(m_workerMutex);
-                        m_frameToProcess = std::move(cpu_frame);
-                        m_processWidth = updateWidth;
-                        m_processHeight = updateHeight;
-                        m_hasNewFrame = true;
-                    }
-                    m_workerCv.notify_one();
-                }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5)); // 轻量睡眠避免过高 CPU 占用
+    }
+}
+
+// ==========================================
+// Win32 + DX11 + ImGui
+// ==========================================
+static ID3D11Device*            g_pd3dDevice = nullptr;
+static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*          g_pSwapChain = nullptr;
+static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+
+bool CreateDeviceD3D(HWND hWnd);
+void CleanupDeviceD3D();
+void CreateRenderTarget();
+void CleanupRenderTarget();
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+    switch (msg) {
+        case WM_SIZE:
+            if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
+                CleanupRenderTarget();
+                g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+                CreateRenderTarget();
             }
+            return 0;
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
+            break;
+        case WM_DESTROY:
+            ::PostQuitMessage(0);
+            return 0;
+    }
+    return ::DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+int main() {
+    load_global_config();
+    scan_data_folder();
+    load_latest_weapons();
+
+    // 🎯 尝试后台静默物理连接
+    if (use_hardware) {
+        g_hw.connect(com_port);
+    }
+
+    std::thread th_recoil(recoil_controller);
+    std::thread th_input(input_thread_loop);
+
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"RecoilManagerUI", nullptr };
+    ::RegisterClassExW(&wc);
+    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"Universal Recoil Dashboard", WS_OVERLAPPEDWINDOW, 150, 150, 800, 560, nullptr, nullptr, wc.hInstance, nullptr);
+
+    if (!CreateDeviceD3D(hwnd)) {
+        CleanupDeviceD3D();
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return 1;
+    }
+
+    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ::UpdateWindow(hwnd);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    MSG msg;
+    ZeroMemory(&msg, sizeof(msg));
+    while (msg.message != WM_QUIT && is_running) {
+        if (::PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessage(&msg);
+            continue;
         }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+        ImGui::Begin("MainPanel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        ImVec2 display_size = ImGui::GetIO().DisplaySize;
-        float overlayW = display_size.x;
-        float overlayH = display_size.y;
-
-        // 1. 读取最新的检测数据
-        std::vector<PoseDetection> currentDetections;
-        int currentWidth = 0, currentHeight = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_detectionsMutex);
-            currentDetections = m_sharedDetections;
-            currentWidth = m_sharedWidth;
-            currentHeight = m_sharedHeight;
+        // ==========================================
+        // 顶部全局状态栏
+        // ==========================================
+        bool macro_on = is_open.load();
+        if (ImGui::Checkbox("Enable Recoil Macro", &macro_on)) {
+            is_open = macro_on;
+            if (!macro_on) is_firing = false; 
         }
+        ImGui::SameLine(250);
+        
+        int cur_active = active_slot.load();
+        ImGui::Text("Active Status: ");
+        ImGui::SameLine();
+        if (!macro_on) {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "SYSTEM OFF");
+        } else if (cur_active == -1) {
+            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.3f, 1.0f), "Knife / Disengaged");
+        } else {
+            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Slot %d (%s)", cur_active + 1, slots[cur_active].weapon_name.c_str());
+        }
+        
+        ImGui::Separator();
 
-        // 2. 🎯 计算目标窗口的 整个窗口区 (Window) 与 客户游戏画面区 (Client) 之间的像素偏差
-        int offsetX, offsetY, clientW, clientH;
-        get_wh(offsetX, offsetY, clientW, clientH);
-
-        if (m_showCropZone.load() && currentWidth > 0 && currentHeight > 0 && clientW > 0 && clientH > 0) {
-            ImU32 boxColor = IM_COL32(0, 255, 0, 255);
-            ImU32 kptColor = IM_COL32(255, 0, 0, 255);
-            ImU32 lineColor = IM_COL32(255, 255, 255, 220);
-
-            const float kpt_threshold = 0.5f;
-
-            for (const auto& det : currentDetections) {
-                // 将 YOLO 坐标减去偏差值，还原为纯游戏画面内部的坐标
-                float c_x1 = det.box.x - offsetX;
-                float c_y1 = det.box.y - offsetY;
-                float c_w = det.box.width;
-                float c_h = det.box.height;
-
-                // 比例映射到覆层
-                ImVec2 p1 = ImVec2((c_x1 / clientW) * overlayW, (c_y1 / clientH) * overlayH);
-                ImVec2 p2 = ImVec2(((c_x1 + c_w) / clientW) * overlayW, ((c_y1 + c_h) / clientH) * overlayH);
-
-                drawList->AddRect(p1, p2, boxColor, 0.0f, 0, 2.0f);
-
-                std::string label = "Person: " + std::to_string(det.score).substr(0, 4);
-                drawList->AddText(ImVec2(p1.x, p1.y - 15.0f), boxColor, label.c_str());
-
-                // 绘制骨骼连接线
-                for (const auto& conn : SKELETON_CONNECTIONS) {
-                    const auto& kpt1 = det.keypoints[conn.first];
-                    const auto& kpt2 = det.keypoints[conn.second];
-
-                    if (kpt1.confidence > kpt_threshold && kpt2.confidence > kpt_threshold) {
-                        float kpt1_cx = kpt1.x - offsetX;
-                        float kpt1_cy = kpt1.y - offsetY;
-                        float kpt2_cx = kpt2.x - offsetX;
-                        float kpt2_cy = kpt2.y - offsetY;
-
-                        ImVec2 pt1 = ImVec2((kpt1_cx / clientW) * overlayW, (kpt1_cy / clientH) * overlayH);
-                        ImVec2 pt2 = ImVec2((kpt2_cx / clientW) * overlayW, (kpt2_cy / clientH) * overlayH);
-                        drawList->AddLine(pt1, pt2, lineColor, 2.0f);
-                    }
-                }
-
-                // 绘制关键点圆点
-                for (size_t i = 0; i < det.keypoints.size(); ++i) {
-                    const auto& kpt = det.keypoints[i];
-                    if (kpt.confidence > kpt_threshold) {
-                        float kpt_cx = kpt.x - offsetX;
-                        float kpt_cy = kpt.y - offsetY;
-
-                        ImVec2 pt = ImVec2((kpt_cx / clientW) * overlayW, (kpt_cy / clientH) * overlayH);
-                        drawList->AddCircleFilled(pt, 4.0f, kptColor);
-                    }
-                }
-
-                Point2D head = GetHeadCenter(det, 0.5f);
-
-                if (head.valid && clientW > 1 && clientH > 1) {
-                    // a. 将头部坐标转换至游戏画面（客户区）绝对像素坐标
-                    float head_cx = head.x - offsetX;
-                    float head_cy = head.y - offsetY;
-
-                    // b. 计算游戏画面的中心点（您的游戏准星位置）
-                    float centerX = clientW / 2.0f;
-                    float centerY = clientH / 2.0f;
-
-                    // c. 计算相对于中心的相对像素位移量 (dx, dy)
-                    float dx = head_cx - centerX;
-                    float dy = head_cy - centerY;
-
-                    // 🎯 此时 (dx, dy) 就是您所需要的“相对于准星的相对坐标”！
-                    
-                    // (可选测试)：在 Overlay 界面上绘制一条从游戏准星(中心)指向人物头部的指示线和文字
-                    ImVec2 scr_center = ImVec2(overlayW / 2.0f, overlayH / 2.0f);
-                    ImVec2 scr_head = ImVec2((head_cx / clientW) * overlayW, (head_cy / clientH) * overlayH);
-                    
-                    // 画一条明黄色的线连向头部
-                    drawList->AddLine(scr_center, scr_head, IM_COL32(255, 235, 59, 200), 1.5f);
-
-                    // 实时在头上显示相对像素距离
-                    std::string offset_text = "Offset: (" + std::to_string((int)dx) + ", " + std::to_string((int)dy) + ")";
-                    drawList->AddText(ImVec2(scr_head.x - 40.0f, scr_head.y - 30.0f), IM_COL32(255, 235, 59, 255), offset_text.c_str());
-                }
+        // ==========================================
+        // 选项卡系统
+        // ==========================================
+        if (ImGui::BeginTabBar("MainTabs")) {
             
+            // ----------------------------------------
+            // 标签页 1：武器与弹道仪表盘
+            // ----------------------------------------
+            if (ImGui::BeginTabItem("Dashboard & Weapons")) {
+                ImGui::Spacing();
+                ImGui::Columns(2, "WeaponLayout", false);
+                ImGui::SetColumnWidth(0, 400.0f);
+
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "WEAPON SLOTS SELECTION");
+                ImGui::Spacing();
+                bool selection_changed = false;
+
+                for (int i = 0; i < 3; ++i) {
+                    std::string slot_title;
+                    if (i == 0) slot_title = "Slot 1 (Primary Weapon)";
+                    else if (i == 1) slot_title = "Slot 2 (Secondary Weapon)";
+                    else if (i == 2) slot_title = "Slot 4 (Pistol Weapon)";
+
+                    ImGui::PushID(i);
+                    ImGui::Text("%s", slot_title.c_str());
+                    ImGui::SetNextItemWidth(350.0f);
+                    if (ImGui::BeginCombo("##WeaponCombo", slots[i].file_name.c_str())) {
+                        for (const auto& file : weapon_files) {
+                            bool is_selected = (slots[i].file_name == file);
+                            if (ImGui::Selectable(file.c_str(), is_selected)) {
+                                if (slots[i].file_name != file) {
+                                    load_weapon_to_slot(i, file);
+                                    selection_changed = true;
+                                }
+                            }
+                            if (is_selected) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::PopID();
+                    ImGui::Spacing();
+                }
+
+                if (selection_changed) save_latest_weapons();
+
+                // ----------------------------------------
+                // 右侧栏：传统的当前物理选中枪支调参区
+                // ----------------------------------------
+                ImGui::NextColumn();
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "LIVE PARAMETERS TUNING");
+                ImGui::Spacing();
+
+                if (cur_active >= 0 && cur_active < 3) {
+                    if (slots[cur_active].file_name != "None") {
+                        
+                        char name_buf[128] = { 0 };
+                        size_t len = slots[cur_active].weapon_name.copy(name_buf, sizeof(name_buf) - 1);
+                        name_buf[len] = '\0';
+
+                        ImGui::SetNextItemWidth(250.0f);
+                        if (ImGui::InputText("Weapon Name", name_buf, sizeof(name_buf))) {
+                            slots[cur_active].weapon_name = name_buf;
+                        }
+
+                        ImGui::SetNextItemWidth(250.0f);
+                        int temp_delay = slots[cur_active].delay_ms;
+                        if (ImGui::InputInt("Trigger Delay (ms)", &temp_delay, 10, 100)) {
+                            if (temp_delay < 0) temp_delay = 0;
+                            slots[cur_active].delay_ms = temp_delay;
+                        }
+
+                        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+                        bool ratio_changed = false;
+                        float hr = slots[cur_active].hr;
+                        float vr = slots[cur_active].vr;
+
+                        ImGui::SetNextItemWidth(250.0f);
+                        if (ImGui::SliderFloat("Horiz Multiplier", &hr, 0.1f, 5.0f, "%.2f")) {
+                            slots[cur_active].hr = hr;
+                            ratio_changed = true;
+                        }
+                        ImGui::SetNextItemWidth(250.0f);
+                        if (ImGui::SliderFloat("Vert Multiplier", &vr, 0.1f, 5.0f, "%.2f")) {
+                            slots[cur_active].vr = vr;
+                            ratio_changed = true;
+                        }
+
+                        if (ratio_changed) {
+                            apply_ratios_to_slot(cur_active);
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.3f, 1.0f));
+                        if (ImGui::Button("Save Changes to Weapon file (JSON/TXT)", ImVec2(280, 32))) {
+                            save_weapon_to_json(cur_active);
+                        }
+                        ImGui::PopStyleColor();
+                    } else {
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No weapon loaded in this active slot.\nSelect a weapon on the left first.");
+                    }
+                } else {
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Melee/Disabled slot active.\nPlease press hotkey 1, 2, or 4 to select a weapon slot to tune.");
+                }
+                
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
             }
+
+            // ----------------------------------------
+            // 标签页 2：系统设置与改键
+            // ----------------------------------------
+            if (ImGui::BeginTabItem("Settings & Keybinds")) {
+                ImGui::Spacing();
+                
+                // 🎯 串口物理硬件选项替换了原先的 Interception 设备设置
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "HARDWARE ACCELERATION (RP2040)");
+                ImGui::Text("Enable this to completely bypass synthetic/software click sending.");
+                
+                if (ImGui::Checkbox("Use RP2040 Physical Controller", &use_hardware)) {
+                    save_global_config();
+                }
+
+                ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::InputText("COM Port ID", com_buf, sizeof(com_buf))) {
+                    com_port = com_buf;
+                }
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    save_global_config();
+                }
+                
+                ImGui::SameLine();
+                if (g_hw.isOpen()) {
+                    if (ImGui::Button("Disconnect")) {
+                        g_hw.close();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "CONNECTED");
+                } else {
+                    if (ImGui::Button("Connect Hardware")) {
+                        if (g_hw.connect(com_port)) {
+                            save_global_config();
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.8f, 0.3f, 0.3f, 1.0f), "DISCONNECTED");
+                }
+
+                ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+                
+                ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "HOTKEYS REBIND PANEL");
+                if (binding_mode.load()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), ">> PRESS ANY KEY TO BIND <<");
+                } else {
+                    ImGui::Text("Click a button below to bind keys:");
+                }
+
+                auto RenderBindButton = [&](const char* label, int* key_var) {
+                    std::string btn_label = std::string(label) + " [" + get_key_name(*key_var) + "]##" + label;
+                    if (ImGui::Button(btn_label.c_str(), ImVec2(300, 26))) {
+                        target_bind = key_var;
+                        binding_mode = true;
+                    }
+                };
+
+                ImGui::Columns(2, "BindsLayout", false);
+                RenderBindButton("Toggle Macro Key", &hotkeys.toggle_macro);
+                RenderBindButton("Reload Setup Key", &hotkeys.reload_config);
+                RenderBindButton("Exit Manager Key", &hotkeys.exit_app);
+                
+                ImGui::NextColumn();
+                RenderBindButton("Slot 1 (Primary) Key", &hotkeys.primary);
+                RenderBindButton("Slot 2 (Secondary) Key", &hotkeys.secondary);
+                RenderBindButton("Slot 3 (Knife/Off) Key", &hotkeys.melee);
+                RenderBindButton("Slot 4 (Pistol) Key", &hotkeys.pistol);
+                
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
         }
+        ImGui::End();
 
-        if (m_showCropZone.load() && clientW > 1 && clientH > 1) {
-            auto [_roi_w, _roi_h] = roi;
-
-            float crop_x = std::max(0.0f, (clientW - _roi_w) / 2.0f);
-            float crop_y = std::max(0.0f, (clientH - _roi_h) / 2.0f);
-            float crop_w = std::min(_roi_w, clientW);
-            float crop_h = std::min(_roi_h, clientH);
-
-            ImVec2 cp1 = ImVec2((crop_x / clientW) * overlayW, (crop_y / clientH) * overlayH);
-            ImVec2 cp2 = ImVec2(((crop_x + crop_w) / clientW) * overlayW, ((crop_y + crop_h) / clientH) * overlayH);
-
-            // 绘制黄色半透明边框，让用户直观地看到 640x640 ROI 工作视野
-            drawList->AddRect(cp1, cp2, IM_COL32(255, 235, 59, 130), 0.0f, 0, 1.5f);
-
-            std::ostringstream os;
-            os << "[YOLO Active Region (" << _roi_w << " * " << _roi_h << ")]";
-            drawList->AddText(ImVec2(cp1.x + 6.0f, cp1.y + 6.0f), IM_COL32(255, 235, 59, 180), os.str().c_str());
-        }
-
-        // 提交渲染
         ImGui::Render();
-        ID3D11RenderTargetView* rtvList[] = { m_rtv.get() };
-        m_d3dContext->OMSetRenderTargets(1, rtvList, nullptr);
-        
-        const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        m_d3dContext->ClearRenderTargetView(m_rtv.get(), clearColor);
-        
+        const float clear_color[4] = { 0.15f, 0.15f, 0.15f, 1.0f };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        m_swapChain->Present(1, 0);
+        g_pSwapChain->Present(1, 0);
     }
 
-private:
-    HWND m_targetHwnd = nullptr;
-    HWND m_viewerHwnd = nullptr;
-    std::mutex m_mutex;
+    is_running = false;
+    if (th_recoil.joinable()) th_recoil.join();
+    if (th_input.joinable()) th_input.join(); 
 
-    // Direct3D 11 资源
-    winrt::com_ptr<ID3D11Device> m_d3dDevice;
-    winrt::com_ptr<ID3D11DeviceContext> m_d3dContext;
-    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_winrtDevice{ nullptr };
-    winrt::com_ptr<IDXGISwapChain1> m_swapChain;
-    winrt::com_ptr<ID3D11RenderTargetView> m_rtv;
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    CleanupDeviceD3D();
+    ::DestroyWindow(hwnd);
+    ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
-    // 后台推理线程与主渲染线程图像缓存
-    winrt::com_ptr<ID3D11Texture2D> m_pendingTexture;
-    winrt::com_ptr<ID3D11Texture2D> m_stagingTexture;
-
-    // 捕获相关资源
-    winrt::Windows::Graphics::Capture::GraphicsCaptureItem m_item{ nullptr };
-    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_framePool{ nullptr };
-    winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{ nullptr };
-    winrt::event_token m_frameArrivedToken;
-
-    int m_pendingWidth = 0;
-    int m_pendingHeight = 0;
-    int m_currentWidth = 0;
-    int m_currentHeight = 0;
-
-    // YOLO26-Pose 成员
-    std::unique_ptr<Ort::Env> m_ortEnv;
-    std::unique_ptr<Ort::Session> m_ortSession;
-    Ort::AllocatorWithDefaultOptions m_ortAllocator;
-    std::string m_inputName;
-    std::string m_outputName;
-    bool m_yoloInitialized = false;
-
-    // 优化：异步推理工作线程控制变量
-    std::thread m_workerThread;
-    std::mutex m_workerMutex;
-    std::condition_variable m_workerCv;
-    bool m_workerRunning = false;
-    cv::Mat m_frameToProcess;
-    int m_processWidth = 0;
-    int m_processHeight = 0;
-    bool m_hasNewFrame = false;
-
-    // 🎯 新增：Interception 按键监听线程管理变量
-    std::thread m_inputThread;
-    InterceptionContext m_interceptionContext = nullptr;
-    std::atomic<bool> m_inputRunning{ false };
-    std::atomic<bool> m_showCropZone{ true }; // 默认为开启状态，控制 黄色检测区域的绘制
-
-    // 优化：线程安全的结果共享缓冲区
-    std::vector<PoseDetection> m_sharedDetections;
-    std::mutex m_detectionsMutex;
-    int m_sharedWidth = 0;
-    int m_sharedHeight = 0;
-};
-
-// ==========================================
-// 模块 3: 主入口
-// ==========================================
-int main() {
-    winrt::init_apartment(winrt::apartment_type::single_threaded);
-
-    try {
-        std::vector<std::string> player_keywords = {
-            "电影和电视",       
-            "Media Player",     
-            "PotPlayer",        
-            "VLC media player", 
-            "ActiveMovie Window",
-            "媒体播放器",
-            "三角洲行动"
-        };
-
-        HWND targetHwnd = Utils::FindWindowByTitleKeywords(player_keywords);
-        if (!targetHwnd) {
-            std::cerr << "未检测到支持的视频播放器或游戏运行，请先运行播放器或三角洲行动！\n";
-            return 1;
-        }
-
-        char window_title[256];
-        GetWindowTextA(targetHwnd, window_title, sizeof(window_title));
-        std::cout << "目标锁定窗口: \"" << window_title << "\" (句柄: " << targetHwnd << ")\n";
-        
-        WindowOverlay overlay(targetHwnd);
-        overlay.Start();
-
-    } catch (winrt::hresult_error const& ex) {
-        std::cerr << "WinRT 异常: " << winrt::to_string(ex.message()) << std::endl;
-    } catch (std::exception const& ex) {
-        std::cerr << "标准异常: " << ex.what() << std::endl;
-    }
-    
     return 0;
+}
+
+bool CreateDeviceD3D(HWND hWnd) {
+    DXGI_SWAP_CHAIN_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+        return false;
+    CreateRenderTarget();
+    return true;
+}
+
+void CleanupDeviceD3D() {
+    CleanupRenderTarget();
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
+
+void CreateRenderTarget() {
+    ID3D11Texture2D* pBackBuffer;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+}
+
+void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
 }

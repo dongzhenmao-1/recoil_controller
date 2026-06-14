@@ -35,7 +35,7 @@ include_directories("${MY_DEPS_DIR}/include")
 # ==============================================================================
 
 # 【库 1】Interception
-find_library(INTERCEPTION_LIB interception PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
+# find_library(INTERCEPTION_LIB interception PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
 
 # 【库 2】OpenCV (4.10.0 world 架构)
 find_library(OPENCV_LIB opencv_world4100 PATHS "${MY_DEPS_DIR}/lib" NO_DEFAULT_PATH)
@@ -90,7 +90,7 @@ foreach(tgt ${MY_PROJECT_TARGETS})
         imgui_lib
         
         # 链接 Interception
-        ${INTERCEPTION_LIB}
+        # ${INTERCEPTION_LIB}
         
         # 链接 OpenCV
         ${OPENCV_LIB}
